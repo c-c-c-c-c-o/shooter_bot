@@ -1,291 +1,282 @@
-"""A zone-aware mechfight bot focused on surviving to a good placement."""
+#!/usr/bin/env python3
+"""Richer rule-based bot for the local flat 2D duel simulator."""
 from __future__ import annotations
 
 import math
+import sys
+from pathlib import Path
+
+bot_root = Path(__file__).resolve().parent
+if not (bot_root / "mechfight.py").is_file():
+    bot_root = bot_root.parent / "shooter_bot"
+sys.path.insert(0, str(bot_root))
 
 import mechfight as mf
-
-
-def _distance(a: list[float], b: list[float]) -> float:
-    return math.dist(a[:2], b[:2])
 
 
 def _wrap(angle: float) -> float:
     return (angle + math.pi) % (2 * math.pi) - math.pi
 
 
-def _aim_at(point: list[float], origin: list[float]) -> list[float]:
-    dx, dy, dz = point[0] - origin[0], point[1] - origin[1], point[2] - origin[2]
-    return [math.atan2(dy, dx), math.atan2(dz, math.hypot(dx, dy))]
+def _distance(a: list[float], b: list[float]) -> float:
+    return math.hypot(a[0] - b[0], a[1] - b[1])
 
 
-def _gun_intercept(target: dict, me: dict, speed: float) -> list[float]:
-    pos, vel = target["pos"], target["vel"]
-    rx, ry = pos[0] - me["pos"][0], pos[1] - me["pos"][1]
-    vx, vy = vel[0], vel[1]
-    a = vx * vx + vy * vy - speed * speed
+def _unit(x: float, y: float) -> tuple[float, float]:
+    length = math.hypot(x, y)
+    if length < 1e-8:
+        return 0.0, 0.0
+    return x / length, y / length
+
+
+def _intercept_yaw(me: dict, target: dict, bullet_speed: float) -> float:
+    rx = target["pos"][0] - me["pos"][0]
+    ry = target["pos"][1] - me["pos"][1]
+    vx, vy = target["vel"][0], target["vel"][1]
+    a = vx * vx + vy * vy - bullet_speed * bullet_speed
     b = 2 * (rx * vx + ry * vy)
     c = rx * rx + ry * ry
-    disc = b * b - 4 * a * c
     times = []
-    if abs(a) < 1e-6:
-        if abs(b) > 1e-6:
-            times = [-c / b]
-    elif disc >= 0:
-        root = math.sqrt(disc)
-        times = [(-b - root) / (2 * a), (-b + root) / (2 * a)]
-    positive = [t for t in times if t > 0]
-    flight = min(positive) if positive else math.sqrt(c) / max(speed, 1)
-    muzzle = me["pos"][2] + me["stats"].get("muzzle_height", 7)
-    return _aim_at(
-        [pos[0] + vx * flight, pos[1] + vy * flight,
-         pos[2] + 4.5 + vel[2] * flight],
-        [me["pos"][0], me["pos"][1], muzzle],
-    )
-
-
-def _mortar_aim(target: dict, me: dict, speed: float, gravity: float) -> list[float] | None:
-    pos, vel = target["pos"], target["vel"]
-    muzzle_z = me["pos"][2] + me["stats"].get("muzzle_height", 7)
-    flight = 0.0
-    pitch = 0.0
-    predicted = pos
-    for _ in range(3):
-        predicted = [pos[i] + vel[i] * flight for i in range(3)]
-        dx, dy = predicted[0] - me["pos"][0], predicted[1] - me["pos"][1]
-        horizontal = math.hypot(dx, dy)
-        if horizontal < 1:
-            return None
-        height = predicted[2] + 4.5 - muzzle_z
-        disc = speed ** 4 - gravity * (gravity * horizontal ** 2 + 2 * height * speed ** 2)
-        if disc < 0:
-            return None
-        tangent = (speed ** 2 - math.sqrt(disc)) / (gravity * horizontal)
-        pitch = math.atan(tangent)
-        flight = horizontal / max(speed * math.cos(pitch), 1)
-    return [math.atan2(predicted[1] - me["pos"][1], predicted[0] - me["pos"][0]), pitch]
-
-
-def _weapon_score(kind: str, enemies: list[dict], distance: float) -> float:
-    if kind == "laser":
-        score = 4.0
-        if any("mortar" in enemy.get("weapons", []) for enemy in enemies):
-            score += 1.0
-        return score
-    if kind == "mortar":
-        score = 3.8
-        if any("lightning" in enemy.get("weapons", []) for enemy in enemies):
-            score += 1.0
-        return score
-    if kind == "lightning":
-        return 4.5 if distance < 45 and any(
-            "laser" in enemy.get("weapons", []) for enemy in enemies
-        ) else 2.8
-    return 0.0
+    if abs(a) < 1e-8:
+        if abs(b) > 1e-8:
+            times.append(-c / b)
+    else:
+        discriminant = b * b - 4 * a * c
+        if discriminant >= 0:
+            root = math.sqrt(discriminant)
+            times.extend(((-b - root) / (2 * a), (-b + root) / (2 * a)))
+    flight = min((t for t in times if t > 0), default=math.sqrt(c) / bullet_speed)
+    future_x = target["pos"][0] + vx * flight
+    future_y = target["pos"][1] + vy * flight
+    return math.atan2(future_y - me["pos"][1], future_x - me["pos"][0])
 
 
 class Bot:
-    name = "oval-survivor"
+    name = "rich-heuristic"
 
     def __init__(self, hello: mf.Hello):
         self.seed = int(hello["seed"])
-        self.pickup_radius = hello["config"]["loot"]["pickup_radius"]
-        self.weapons = hello["config"]["weapons"]
+        self.config = hello["config"]
+        self.last_attacker: int | None = None
+        self.last_attacked_at = -math.inf
 
-    def _zone_goal(self, obs: mf.Observation, me: dict) -> tuple[list[float], bool]:
-        zone = obs["zone"]
-        x, y = me["pos"][:2]
-        current = zone["center"]
-        next_center = zone["next_center"]
-        shrinking_soon = obs["t"] >= zone["shrink_start"] - 12
-        center = next_center if shrinking_soon else current
-        radius = zone["next_radius"] if shrinking_soon else zone["radius"]
-        dx, dy = x - center[0], y - center[1]
-        dist = math.hypot(dx, dy)
-        safe_radius = max(0.0, radius - 30.0)
-        urgent = not me["in_zone"] or dist > safe_radius
-        if urgent:
-            if dist <= safe_radius or dist < 1e-6:
-                return [x, y], False
-            return [center[0] + dx * safe_radius / dist,
-                    center[1] + dy * safe_radius / dist], True
-
-        # Keep moving within the safe interior instead of standing still.
-        phase = int(obs["t"] / 4.0)
-        angle = (self.seed % 6283) / 1000.0 + phase * 2.399963229728653
-        orbit_radius = min(45.0, max(18.0, radius * 0.12))
-        return [current[0] + math.cos(angle) * orbit_radius,
-                current[1] + math.sin(angle) * orbit_radius], False
-
-    def _choose_target(self, enemies: list[dict], me: dict) -> dict | None:
+    def _select_target(self, obs: mf.Observation, me: dict) -> dict | None:
+        enemies = [actor for actor in obs["mechs"] if actor["kind"] == "mech"]
+        for event in obs["events"]:
+            if event["type"] == "damaged" and event.get("by") is not None:
+                self.last_attacker = int(event["by"])
+                self.last_attacked_at = obs["t"]
         if not enemies:
             return None
-        return min(
-            enemies,
-            key=lambda enemy: _distance(enemy["pos"], me["pos"])
-            - max(0.0, 180.0 - enemy.get("hp", 180.0)) * 0.08,
+
+        def cost(enemy: dict) -> float:
+            distance = _distance(me["pos"], enemy["pos"])
+            hp = enemy.get("hp", enemy.get("max_hp", 700.0))
+            cost_value = distance - max(0.0, 500.0 - hp) * 0.04
+            if enemy["id"] == self.last_attacker and obs["t"] - self.last_attacked_at < 5:
+                cost_value -= 35.0
+            # A nearby opponent is an immediate threat; do not fixate on a
+            # distant, weak target while someone is already pressuring us.
+            if distance < 45:
+                cost_value -= (45 - distance) * 0.5
+            return cost_value
+
+        return min(enemies, key=cost)
+
+    def _preferred_direction(
+        self, obs: mf.Observation, me: dict, target: dict | None
+    ) -> tuple[float, float]:
+        px, py = me["pos"][:2]
+        zone = obs["zone"]
+        cx, cy = zone["center"]
+        dx, dy = px - cx, py - cy
+        radius = max(0.0, zone["radius"])
+        safe_radius = max(0.0, radius - 16.0)
+        radial_distance = math.hypot(dx, dy)
+
+        if radial_distance > safe_radius - 8:
+            return _unit(cx - px, cy - py)
+
+        if target:
+            tx, ty = target["pos"][0] - px, target["pos"][1] - py
+            distance = max(math.hypot(tx, ty), 1.0)
+            toward_x, toward_y = tx / distance, ty / distance
+            desired_range = 82.0
+            radial_weight = max(-1.0, min(0.65, (distance - desired_range) / 55.0))
+            phase = int(obs["t"] / 2.5)
+            side = -1.0 if (phase + self.seed) % 2 else 1.0
+            if distance < 38:
+                radial_weight = -1.0
+            orbit_weight = 0.9 if distance >= 38 else 0.35
+            return _unit(
+                radial_weight * toward_x - side * orbit_weight * toward_y,
+                radial_weight * toward_y + side * orbit_weight * toward_x,
+            )
+
+        # Sweep around a moving waypoint inside the zone while scanning for
+        # opponents. This avoids idling at the center when no one is visible.
+        phase = (self.seed % 997) * 0.013 + obs["t"] * 0.22
+        waypoint_radius = min(90.0, max(20.0, safe_radius * 0.42))
+        goal_x = cx + math.cos(phase) * waypoint_radius
+        goal_y = cy + math.sin(phase) * waypoint_radius
+        return _unit(goal_x - px, goal_y - py)
+
+    def _predict_path(self, me: dict, direction: tuple[float, float]) -> list[tuple[float, float]]:
+        stats = me["stats"]
+        dt = 0.1
+        vx, vy = me["vel"][:2]
+        x, y = me["pos"][:2]
+        speed = stats.get("walk_speed", 11.7)
+        accel = stats.get("ground_accel", 58.5)
+        path = []
+        for _ in range(8):
+            desired_x, desired_y = direction[0] * speed, direction[1] * speed
+            ax, ay = desired_x - vx, desired_y - vy
+            acceleration = math.hypot(ax, ay)
+            max_delta = accel * dt
+            if acceleration > max_delta:
+                ax, ay = ax * max_delta / acceleration, ay * max_delta / acceleration
+            vx += ax
+            vy += ay
+            x += vx * dt
+            y += vy * dt
+            path.append((x, y))
+        return path
+
+    def _projectile_risk(
+        self, obs: mf.Observation, me: dict, path: list[tuple[float, float]]
+    ) -> float:
+        risk = 0.0
+        for projectile in obs["projectiles"]:
+            px, py = projectile["pos"][:2]
+            vx, vy = projectile["vel"][:2]
+            for index, (mx, my) in enumerate(path):
+                time = (index + 1) * 0.1
+                distance = math.hypot(px + vx * time - mx, py + vy * time - my)
+                if distance < 11.0:
+                    risk += (11.0 - distance) ** 2 * 0.45
+        return risk
+
+    def _aimline_risk(
+        self, target: dict | None, me: dict, path: list[tuple[float, float]]
+    ) -> float:
+        if target is None:
+            return 0.0
+        ex, ey = target["pos"][:2]
+        yaw = target["aim"][0]
+        ux, uy = math.cos(yaw), math.sin(yaw)
+        distance = _distance(me["pos"], target["pos"])
+        direct_bearing = math.atan2(me["pos"][1] - ey, me["pos"][0] - ex)
+        if abs(_wrap(direct_bearing - yaw)) > 0.42 or distance > 230:
+            return 0.0
+
+        risk = 0.0
+        for index, (mx, my) in enumerate(path):
+            rx, ry = mx - ex, my - ey
+            along = rx * ux + ry * uy
+            if along <= 0 or along > 230:
+                continue
+            cross_track = abs(rx * uy - ry * ux)
+            if cross_track < 9:
+                risk += (9 - cross_track) ** 2 * 0.22
+        return risk
+
+    def _score_direction(
+        self, direction: tuple[float, float], preferred: tuple[float, float],
+        obs: mf.Observation, me: dict, target: dict | None,
+    ) -> float:
+        path = self._predict_path(me, direction)
+        score = 7.0 * (direction[0] * preferred[0] + direction[1] * preferred[1])
+        zone = obs["zone"]
+        safe_radius = max(0.0, zone["radius"] - 16.0)
+        for index, (x, y) in enumerate(path):
+            distance_from_center = math.hypot(x - zone["center"][0], y - zone["center"][1])
+            outside = max(0.0, distance_from_center - safe_radius)
+            score -= outside * outside * (0.08 + index * 0.005)
+
+        if target:
+            target_future = (
+                target["pos"][0] + target["vel"][0] * 0.8,
+                target["pos"][1] + target["vel"][1] * 0.8,
+            )
+            future_range = math.hypot(path[-1][0] - target_future[0],
+                                      path[-1][1] - target_future[1])
+            score -= abs(future_range - 82.0) * 0.035
+            if future_range < 38:
+                score -= (38 - future_range) * 0.8
+
+        score -= self._projectile_risk(obs, me, path)
+        score -= self._aimline_risk(target, me, path)
+        return score
+
+    def _movement(self, obs: mf.Observation, me: dict, target: dict | None) -> tuple[list[float], bool]:
+        preferred = self._preferred_direction(obs, me, target)
+        directions = [(0.0, 0.0)]
+        directions.extend(
+            (math.cos(index * math.tau / 24), math.sin(index * math.tau / 24))
+            for index in range(24)
         )
+        directions.append(preferred)
+        best = max(
+            directions,
+            key=lambda direction: self._score_direction(
+                direction, preferred, obs, me, target
+            ),
+        )
+
+        zone = obs["zone"]
+        zone_distance = math.hypot(
+            me["pos"][0] - zone["center"][0],
+            me["pos"][1] - zone["center"][1],
+        )
+        outside = zone_distance > max(0.0, zone["radius"] - 16.0)
+        close_threat = any(
+            math.hypot(p["pos"][0] - me["pos"][0], p["pos"][1] - me["pos"][1]) < 22
+            for p in obs["projectiles"]
+        )
+        boost = me["energy"] > 15 and (
+            (outside and zone_distance > zone["radius"] + 3)
+            or (close_threat and me["energy"] > 55)
+        )
+        return [best[0], best[1]], boost
 
     def act(self, obs: mf.Observation) -> mf.Action:
         me = obs["self"]
-        x, y, z = me["pos"]
-        action: mf.Action = {"tick": obs["tick"]}
-        enemies = [m for m in obs["mechs"] if m["kind"] == "mech"]
-        target = self._choose_target(enemies, me)
-        target_distance = _distance(target["pos"], me["pos"]) if target else math.inf
+        target = self._select_target(obs, me)
+        move, boost = self._movement(obs, me, target)
 
-        if obs["offer"]:
-            priorities = {
-                "armor": 110, "plating": 100, "nanites": 88, "servos": 82,
-                "sensors": 78, "gun_rate": 76, "gun_damage": 74,
-                "laser_damage": 90, "laser_charge": 88, "mortar_reload": 72,
-                "lightning_range": 70, "lightning_efficiency": 72,
-                "jets": 68, "mortar_splash": 64, "mortar_velocity": 61,
-                "gun_velocity": 66, "gun_mag": 58, "capacitor": 52,
-                "reactor": 48, "gyros": 48, "laser_pierce": 55,
-                "lightning_chain": 67,
-            }
-            choices = obs["offer"]["choices"]
-            action["pick"] = max(
-                range(len(choices)),
-                key=lambda i: priorities.get(choices[i]["id"], 0),
-            )
-
-        weapon_slots = me["weapons"]
-        held = {w["kind"] for w in weapon_slots if w is not None}
-        pickups = [
-            p for p in obs["pickups"]
-            if p["kind"] != "gun" and p["kind"] not in held
-        ]
-        if pickups:
-            nearest_pickup = min(pickups, key=lambda p: _distance(p["pos"], me["pos"]))
-            pickup_dist = _distance(nearest_pickup["pos"], me["pos"])
-            if pickup_dist <= self.pickup_radius and abs(nearest_pickup["pos"][2] - z) <= 4:
-                if weapon_slots[1] is None:
-                    action["take"] = nearest_pickup["id"]
-                else:
-                    current_score = _weapon_score(weapon_slots[1]["kind"], enemies, target_distance)
-                    new_score = _weapon_score(nearest_pickup["kind"], enemies, target_distance)
-                    if new_score > current_score + 0.5:
-                        action["take"] = nearest_pickup["id"]
-                        action["drop"] = 1
-
-        goal, zone_urgent = self._zone_goal(obs, me)
-        movement_target = goal
-
-        # A nearby uncontested drop is a large survival boost. Start moving
-        # toward it early enough to arrive just as it lands.
-        for drop in obs["drops"]:
-            distance = _distance(drop["pos"], me["pos"])
-            if drop["holder"] == me["id"]:
-                movement_target = drop["pos"]
-                break
-            if (drop["holder"] is None and distance < 150
-                    and drop["lands_in"] <= distance / 11.7 + 4
-                    and (me["hp"] < me["max_hp"] or me["cubes"] < 10)):
-                movement_target = drop["pos"]
-                break
-
-        # Collect visible cubes and useful weapons when no immediate zone
-        # correction or nearby fight takes precedence.
-        if not zone_urgent and (target is None or target_distance > 80):
-            cube_targets = [c for c in obs["cubes"] if _distance(c["pos"], me["pos"]) < 30]
-            if cube_targets:
-                movement_target = min(cube_targets, key=lambda c: _distance(c["pos"], me["pos"]))["pos"]
-            elif pickups and weapon_slots[1] is None:
-                candidate = min(pickups, key=lambda p: _distance(p["pos"], me["pos"]))
-                if _distance(candidate["pos"], me["pos"]) < 24:
-                    movement_target = candidate["pos"]
-
-        gx, gy = movement_target[0] - x, movement_target[1] - y
-        goal_distance = math.hypot(gx, gy)
-        move_x, move_y = (gx / goal_distance, gy / goal_distance) if goal_distance > 1 else (0.0, 0.0)
-
-        # Strafe unpredictably while under fire, but retain a strong vector
-        # toward safety when outside the zone.
-        if target and target_distance < 70:
-            tx, ty = target["pos"][0] - x, target["pos"][1] - y
-            length = max(math.hypot(tx, ty), 1.0)
-            if target_distance < 32:
-                dodge = (-tx / length, -ty / length)
-            else:
-                side = -1.0 if (int(obs["t"] / 2.0) + self.seed) % 2 else 1.0
-                dodge = (-ty / length * side, tx / length * side)
-            blend = 0.25 if zone_urgent else 0.8
-            move_x, move_y = (move_x * blend + dodge[0] * (1 - blend),
-                              move_y * blend + dodge[1] * (1 - blend))
-            length = math.hypot(move_x, move_y)
-            if length > 1e-6:
-                move_x, move_y = move_x / length, move_y / length
-        action["move"] = [move_x, move_y]
-        action["boost"] = bool(
-            (zone_urgent and goal_distance > 18 and me["energy"] > 12)
-            or (target and target_distance < 45 and me["energy"] > 55)
-        )
-        action["jump"] = bool(me["grounded"] and target and target_distance < 65
-                              and obs["tick"] % 32 == (self.seed % 32))
-
-        aim = None
         if target:
-            gun_stats = weapon_slots[0]["stats"]
-            aim = _gun_intercept(target, me, gun_stats.get("speed", 252.0))
+            weapon = me["weapons"][0]
+            stats = weapon["stats"] if weapon else self.config["weapons"]["gun"]
+            yaw = _intercept_yaw(me, target, stats.get("speed", 252.0))
+            aim = [yaw, 0.0]
         else:
-            # Scan while moving so enemies entering the sensor wedge are found.
-            angle = math.atan2(move_y, move_x) if abs(move_x) + abs(move_y) > 0.1 else me["aim"][0]
-            aim = [angle + 0.65 * math.sin(obs["t"] * 0.7), 0.0]
-        action["aim"] = aim
+            # Rotate the sensor wedge while the movement policy patrols.
+            yaw = (self.seed % 6283) / 1000.0 + obs["t"] * 1.35
+            aim = [_wrap(yaw), 0.0]
 
-        fire = [False, False]
-        gun = weapon_slots[0]
-        if target and gun:
+        action: mf.Action = {
+            "tick": obs["tick"],
+            "move": move,
+            "boost": boost,
+            "aim": aim,
+            "fire": [False, False],
+        }
+
+        gun = me["weapons"][0]
+        if gun and target:
             yaw_error = abs(_wrap(aim[0] - me["aim"][0]))
-            pitch_error = abs(aim[1] - me["aim"][1])
-            in_range = target_distance <= gun["stats"].get("range", 230.0)
-            fire[0] = in_range and yaw_error < 0.16 and pitch_error < 0.13
-            if gun.get("ammo", 1) <= 2 and gun.get("reload", 0) <= 0:
+            distance = _distance(me["pos"], target["pos"])
+            action["fire"] = [
+                distance <= gun["stats"].get("range", 230.0)
+                and yaw_error < 0.14,
+                False,
+            ]
+            if (gun.get("ammo", 0) <= 2 and gun.get("reload", 0) <= 0
+                    and gun.get("ammo", 0) < gun["stats"].get("mag", 12)):
                 action["reload"] = True
 
-        secondary = weapon_slots[1]
-        if target and secondary:
-            kind = secondary["kind"]
-            stats = secondary["stats"]
-            secondary_aim = aim
-            mortar_reachable = False
-            if kind == "mortar":
-                if target_distance < 35:
-                    secondary_aim = aim
-                else:
-                    secondary_aim = _mortar_aim(
-                        target, me, stats.get("speed", 72.0),
-                        self.weapons["mortar"].get("gravity", 22.0),
-                    )
-                    mortar_reachable = secondary_aim is not None
-                    if not mortar_reachable:
-                        secondary_aim = aim
-            action["aim"] = secondary_aim
-            yaw_error = abs(_wrap(secondary_aim[0] - me["aim"][0]))
-            pitch_error = abs(secondary_aim[1] - me["aim"][1])
-            aligned = yaw_error < 0.12 and pitch_error < 0.12
-
-            if kind == "laser":
-                charge = secondary.get("charge", 0.0)
-                full_charge = stats.get("charge", 0.75)
-                fire[1] = not (charge >= full_charge - 0.03 and aligned)
-            elif kind == "mortar":
-                fire[1] = bool(
-                    mortar_reachable
-                    and yaw_error < 0.16 and pitch_error < 0.15
-                )
-            elif kind == "lightning":
-                fire[1] = bool(
-                    target_distance <= stats.get("range", 45.0)
-                    and yaw_error < math.radians(stats.get("cone_deg", 30.0) * 0.4)
-                )
-            if kind == "mortar" and target_distance >= 35:
-                fire[0] = False
-        action["fire"] = fire
-
-        mf.draw.label(f"hp {me['hp']:.0f} | alive {obs['alive']:.0f}")
+        mf.draw.label(f"HP {me['hp']:.0f} | threats {len(obs['projectiles'])}")
         return action
 
 

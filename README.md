@@ -1,8 +1,8 @@
 # Oval Survivor
 
 Python bot for the Builders Mech Royale `mechfight/1` interface. It prioritizes
-staying inside the safe zone, moving unpredictably around nearby opponents,
-leading arm-gun shots, and using found weapons and upgrades.
+safe-zone positioning, dodging predicted incoming fire, selecting nearby
+threats, and leading arm-gun shots.
 
 The official Python wrapper, protocol, schema, checker, and arena map are kept
 at the repository root.
